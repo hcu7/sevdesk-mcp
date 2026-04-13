@@ -734,12 +734,23 @@ async def _dispatch(name: str, args: dict) -> object:  # noqa: PLR0912 PLR0915
 sse_transport = SseServerTransport("/messages/")
 
 
+def _is_in_cidr(ip: str, cidr: str) -> bool:
+    import ipaddress
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return False
+
+ANTHROPIC_CIDR = "160.79.104.0/21"
+
 async def check_auth(request: Request) -> JSONResponse | None:
-    """Return a 401 response if auth fails, or None if OK."""
+    """Return a 401 response if auth fails, or None if OK. Skip for Anthropic IPs."""
     if MCP_AUTH_TOKEN:
-        auth = request.headers.get("authorization", "")
-        if auth != f"Bearer {MCP_AUTH_TOKEN}":
-            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        if not _is_in_cidr(client_ip, ANTHROPIC_CIDR):
+            auth = request.headers.get("authorization", "")
+            if auth != f"Bearer {MCP_AUTH_TOKEN}":
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
     return None
 
 
