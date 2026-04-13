@@ -14,6 +14,7 @@ from starlette.routing import Mount, Route
 
 SEVDESK_BASE_URL = os.environ.get("SEVDESK_BASE_URL", "https://my.sevdesk.de/api/v1")
 SEVDESK_API_TOKEN = os.environ.get("SEVDESK_API_TOKEN", "")
+MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 
 mcp_server = Server("sevdesk-mcp")
 
@@ -733,7 +734,19 @@ async def _dispatch(name: str, args: dict) -> object:  # noqa: PLR0912 PLR0915
 sse_transport = SseServerTransport("/messages/")
 
 
+async def check_auth(request: Request) -> JSONResponse | None:
+    """Return a 401 response if auth fails, or None if OK."""
+    if MCP_AUTH_TOKEN:
+        auth = request.headers.get("authorization", "")
+        if auth != f"Bearer {MCP_AUTH_TOKEN}":
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return None
+
+
 async def handle_sse(request: Request):
+    denied = await check_auth(request)
+    if denied:
+        return denied
     async with sse_transport.connect_sse(
         request.scope, request.receive, request._send
     ) as streams:
