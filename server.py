@@ -12,9 +12,19 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
+import ipaddress
+import time
+import uuid as uuid_mod
+
 SEVDESK_BASE_URL = os.environ.get("SEVDESK_BASE_URL", "https://my.sevdesk.de/api/v1")
 SEVDESK_API_TOKEN = os.environ.get("SEVDESK_API_TOKEN", "")
 MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
+OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
+ANTHROPIC_CIDR = "160.79.104.0/21"
+
+_oauth_codes: dict[str, float] = {}
+_oauth_tokens: set[str] = set()
 
 mcp_server = Server("sevdesk-mcp")
 
@@ -734,24 +744,60 @@ async def _dispatch(name: str, args: dict) -> object:  # noqa: PLR0912 PLR0915
 sse_transport = SseServerTransport("/messages/")
 
 
-def _is_in_cidr(ip: str, cidr: str) -> bool:
-    import ipaddress
-    try:
-        return ipaddress.ip_address(ip) in ipaddress.ip_network(cidr, strict=False)
-    except ValueError:
-        return False
-
-ANTHROPIC_CIDR = "160.79.104.0/21"
-
 async def check_auth(request: Request) -> JSONResponse | None:
-    """Return a 401 response if auth fails, or None if OK. Skip for Anthropic IPs."""
-    if MCP_AUTH_TOKEN:
-        client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-        if not _is_in_cidr(client_ip, ANTHROPIC_CIDR):
-            auth = request.headers.get("authorization", "")
-            if auth != f"Bearer {MCP_AUTH_TOKEN}":
-                return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    return None
+    """Return a 401 response if auth fails, or None if OK."""
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    try:
+        is_anthropic = ipaddress.ip_address(client_ip) in ipaddress.ip_network(ANTHROPIC_CIDR, strict=False)
+    except ValueError:
+        is_anthropic = False
+
+    if is_anthropic:
+        return None
+
+    auth = request.headers.get("authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else ""
+
+    if MCP_AUTH_TOKEN and token == MCP_AUTH_TOKEN:
+        return None
+    if token in _oauth_tokens:
+        return None
+
+    return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+
+async def oauth_authorize(request: Request):
+    client_id = request.query_params.get("client_id", "")
+    redirect_uri = request.query_params.get("redirect_uri", "")
+    state = request.query_params.get("state", "")
+
+    if client_id != OAUTH_CLIENT_ID or not redirect_uri:
+        return JSONResponse({"error": "invalid_client"}, status_code=400)
+
+    code = uuid_mod.uuid4().hex
+    _oauth_codes[code] = time.time() + 60
+    from starlette.responses import RedirectResponse
+    from urllib.parse import quote
+    return RedirectResponse(f"{redirect_uri}?code={code}&state={quote(state)}")
+
+
+async def oauth_token(request: Request):
+    body = (await request.body()).decode()
+    from urllib.parse import parse_qs
+    params = {k: v[0] for k, v in parse_qs(body).items()}
+
+    if params.get("client_id") != OAUTH_CLIENT_ID or params.get("client_secret") != OAUTH_CLIENT_SECRET:
+        return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+    code = params.get("code", "")
+    if params.get("grant_type") == "authorization_code" and code:
+        expiry = _oauth_codes.pop(code, 0)
+        if time.time() > expiry:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+    access_token = uuid_mod.uuid4().hex
+    _oauth_tokens.add(access_token)
+    return JSONResponse({"access_token": access_token, "token_type": "Bearer"})
 
 
 async def handle_sse(request: Request):
@@ -772,13 +818,16 @@ async def health(request: Request):
     return JSONResponse({"status": "ok", "server": "sevdesk-mcp"})
 
 
-app = Starlette(
-    routes=[
-        Route("/health", health),
-        Route("/sse", handle_sse),
-        Mount("/messages/", app=sse_transport.handle_post_message),
-    ]
-)
+routes = [
+    Route("/health", health),
+    Route("/sse", handle_sse),
+    Mount("/messages/", app=sse_transport.handle_post_message),
+]
+if OAUTH_CLIENT_ID:
+    routes.insert(0, Route("/authorize", oauth_authorize))
+    routes.insert(1, Route("/token", oauth_token, methods=["POST"]))
+
+app = Starlette(routes=routes)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8090"))
