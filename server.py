@@ -23,8 +23,23 @@ MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
 OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
 
-_oauth_codes: dict[str, float] = {}
+import base64 as _b64
+import hashlib as _hashlib
+# code → (expiry, code_challenge or "", method or "")
+_oauth_codes: dict[str, tuple[float, str, str]] = {}
 _oauth_tokens: set[str] = set()
+
+
+def _verify_pkce(code_verifier: str, challenge: str, method: str) -> bool:
+    if not challenge:
+        return True
+    if method == "S256":
+        digest = _hashlib.sha256(code_verifier.encode()).digest()
+        computed = _b64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+        return computed == challenge
+    if method in ("", "plain"):
+        return code_verifier == challenge
+    return False
 
 
 def _audit_log(event: dict) -> None:
@@ -778,7 +793,7 @@ async def oauth_discovery_as(request: Request):
         "registration_endpoint": f"{base}/register",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
         "code_challenge_methods_supported": ["S256", "plain"],
         "scopes_supported": ["mcp"],
     })
@@ -809,12 +824,14 @@ async def oauth_authorize(request: Request):
     client_id = request.query_params.get("client_id", "")
     redirect_uri = request.query_params.get("redirect_uri", "")
     state = request.query_params.get("state", "")
+    challenge = request.query_params.get("code_challenge", "")
+    challenge_method = request.query_params.get("code_challenge_method", "plain" if challenge else "")
 
     if client_id != OAUTH_CLIENT_ID or not redirect_uri:
         return JSONResponse({"error": "invalid_client"}, status_code=400)
 
     code = uuid_mod.uuid4().hex
-    _oauth_codes[code] = time.time() + 60
+    _oauth_codes[code] = (time.time() + 60, challenge, challenge_method)
     from starlette.responses import RedirectResponse
     from urllib.parse import quote
     return RedirectResponse(f"{redirect_uri}?code={code}&state={quote(state)}")
@@ -825,13 +842,26 @@ async def oauth_token(request: Request):
     from urllib.parse import parse_qs
     params = {k: v[0] for k, v in parse_qs(body).items()}
 
-    if params.get("client_id") != OAUTH_CLIENT_ID or params.get("client_secret") != OAUTH_CLIENT_SECRET:
+    client_id = params.get("client_id", "")
+    client_secret = params.get("client_secret", "")
+    code = params.get("code", "")
+    code_verifier = params.get("code_verifier", "")
+
+    has_secret = bool(client_secret)
+    has_pkce = bool(code_verifier)
+    if client_id != OAUTH_CLIENT_ID:
+        return JSONResponse({"error": "invalid_client"}, status_code=401)
+    if has_secret and client_secret != OAUTH_CLIENT_SECRET:
+        return JSONResponse({"error": "invalid_client"}, status_code=401)
+    if not has_secret and not has_pkce:
         return JSONResponse({"error": "invalid_client"}, status_code=401)
 
-    code = params.get("code", "")
     if params.get("grant_type") == "authorization_code" and code:
-        expiry = _oauth_codes.pop(code, 0)
-        if time.time() > expiry:
+        entry = _oauth_codes.pop(code, None)
+        if not entry or time.time() > entry[0]:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        _, stored_challenge, stored_method = entry
+        if stored_challenge and not _verify_pkce(code_verifier, stored_challenge, stored_method):
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
     access_token = uuid_mod.uuid4().hex
