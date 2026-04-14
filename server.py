@@ -768,6 +768,43 @@ async def check_auth(request: Request) -> tuple[str | None, JSONResponse | None]
     return None, JSONResponse({"error": "Unauthorized"}, status_code=401)
 
 
+async def oauth_discovery_as(request: Request):
+    host = request.headers.get("host", "")
+    base = f"https://{host}" if host else ""
+    return JSONResponse({
+        "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "registration_endpoint": f"{base}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post"],
+        "code_challenge_methods_supported": ["S256", "plain"],
+        "scopes_supported": ["mcp"],
+    })
+
+
+async def oauth_discovery_pr(request: Request):
+    host = request.headers.get("host", "")
+    base = f"https://{host}" if host else ""
+    return JSONResponse({
+        "resource": base,
+        "authorization_servers": [base],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": ["mcp"],
+    })
+
+
+async def oauth_register(request: Request):
+    return JSONResponse({
+        "client_id": OAUTH_CLIENT_ID,
+        "client_secret": OAUTH_CLIENT_SECRET,
+        "token_endpoint_auth_method": "client_secret_post",
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+    })
+
+
 async def oauth_authorize(request: Request):
     client_id = request.query_params.get("client_id", "")
     redirect_uri = request.query_params.get("redirect_uri", "")
@@ -831,6 +868,9 @@ routes = [
 if OAUTH_CLIENT_ID:
     routes.insert(0, Route("/authorize", oauth_authorize))
     routes.insert(1, Route("/token", oauth_token, methods=["POST"]))
+    routes.insert(2, Route("/.well-known/oauth-authorization-server", oauth_discovery_as))
+    routes.insert(3, Route("/.well-known/oauth-protected-resource", oauth_discovery_pr))
+    routes.insert(4, Route("/register", oauth_register, methods=["POST"]))
 
 app = Starlette(routes=routes)
 
