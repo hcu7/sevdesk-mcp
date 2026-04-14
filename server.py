@@ -13,6 +13,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
 import ipaddress
+import sys
 import time
 import uuid as uuid_mod
 
@@ -21,10 +22,16 @@ SEVDESK_API_TOKEN = os.environ.get("SEVDESK_API_TOKEN", "")
 MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
 OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
-ANTHROPIC_CIDR = "160.79.104.0/21"
 
 _oauth_codes: dict[str, float] = {}
 _oauth_tokens: set[str] = set()
+
+
+def _audit_log(event: dict) -> None:
+    """Write single-line JSON audit record to stdout."""
+    record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "svc": "sevdesk-mcp", **event}
+    print(f"[MCP-AUDIT] {json.dumps(record, separators=(',', ':'))}", flush=True, file=sys.stdout)
 
 mcp_server = Server("sevdesk-mcp")
 
@@ -470,13 +477,17 @@ async def list_tools() -> list[Tool]:
 
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    _audit_log({"event": "tool_call", "tool": name,
+                "arg_keys": sorted(arguments.keys()) if isinstance(arguments, dict) else []})
     try:
         result = await _dispatch(name, arguments)
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
     except httpx.HTTPStatusError as e:
         msg = f"sevDesk API error {e.response.status_code}: {e.response.text}"
+        _audit_log({"event": "tool_error", "tool": name, "err": f"http_{e.response.status_code}"})
         return [TextContent(type="text", text=msg)]
     except Exception as e:
+        _audit_log({"event": "tool_error", "tool": name, "err": type(e).__name__})
         return [TextContent(type="text", text=f"Error: {type(e).__name__}: {e}")]
 
 
@@ -744,17 +755,17 @@ async def _dispatch(name: str, args: dict) -> object:  # noqa: PLR0912 PLR0915
 sse_transport = SseServerTransport("/messages/")
 
 
-async def check_auth(request: Request) -> JSONResponse | None:
-    """Return a 401 response if auth fails, or None if OK."""
+async def check_auth(request: Request) -> tuple[str | None, JSONResponse | None]:
+    """Return (auth_method, None) if OK, or (None, 401-response) if not."""
     auth = request.headers.get("authorization", "")
     token = auth[7:] if auth.startswith("Bearer ") else ""
 
     if MCP_AUTH_TOKEN and token == MCP_AUTH_TOKEN:
-        return None
+        return "bearer", None
     if token in _oauth_tokens:
-        return None
+        return "oauth", None
 
-    return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return None, JSONResponse({"error": "Unauthorized"}, status_code=401)
 
 
 async def oauth_authorize(request: Request):
@@ -792,9 +803,12 @@ async def oauth_token(request: Request):
 
 
 async def handle_sse(request: Request):
-    denied = await check_auth(request)
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    auth_method, denied = await check_auth(request)
     if denied:
+        _audit_log({"event": "sse_connect", "ip": client_ip, "result": "401_unauthorized"})
         return denied
+    _audit_log({"event": "sse_connect", "ip": client_ip, "auth": auth_method})
     async with sse_transport.connect_sse(
         request.scope, request.receive, request._send
     ) as streams:
