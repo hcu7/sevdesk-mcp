@@ -780,7 +780,23 @@ async def check_auth(request: Request) -> tuple[str | None, JSONResponse | None]
     if token in _oauth_tokens:
         return "oauth", None
 
-    return None, JSONResponse({"error": "Unauthorized"}, status_code=401)
+    # Categorize failure for debug log (no token content leaked)
+    if not auth:
+        reason = "no_auth_header"
+    elif not auth.startswith("Bearer "):
+        reason = "not_bearer_scheme"
+    elif not token:
+        reason = "empty_token"
+    else:
+        reason = "unknown_token"
+    host = request.headers.get("host", "")
+    meta_url = f"https://{host}/.well-known/oauth-protected-resource" if host else ""
+    www_auth = f'Bearer realm="mcp", resource_metadata="{meta_url}"'
+    return None, JSONResponse(
+        {"error": "Unauthorized"},
+        status_code=401,
+        headers={"WWW-Authenticate": www_auth, "X-Auth-Reason": reason},
+    )
 
 
 async def oauth_discovery_as(request: Request):
@@ -793,7 +809,7 @@ async def oauth_discovery_as(request: Request):
         "registration_endpoint": f"{base}/register",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post"],
         "code_challenge_methods_supported": ["S256", "plain"],
         "scopes_supported": ["mcp"],
     })
@@ -834,7 +850,9 @@ async def oauth_authorize(request: Request):
     _oauth_codes[code] = (time.time() + 60, challenge, challenge_method)
     from starlette.responses import RedirectResponse
     from urllib.parse import quote
-    return RedirectResponse(f"{redirect_uri}?code={code}&state={quote(state)}")
+    host = request.headers.get("host", "")
+    issuer = f"https://{host}" if host else ""
+    return RedirectResponse(f"{redirect_uri}?code={code}&state={quote(state)}&iss={quote(issuer)}")
 
 
 async def oauth_token(request: Request):
@@ -847,13 +865,10 @@ async def oauth_token(request: Request):
     code = params.get("code", "")
     code_verifier = params.get("code_verifier", "")
 
-    has_secret = bool(client_secret)
-    has_pkce = bool(code_verifier)
+    # Require client_secret; PKCE remains supported as optional additional layer
     if client_id != OAUTH_CLIENT_ID:
         return JSONResponse({"error": "invalid_client"}, status_code=401)
-    if has_secret and client_secret != OAUTH_CLIENT_SECRET:
-        return JSONResponse({"error": "invalid_client"}, status_code=401)
-    if not has_secret and not has_pkce:
+    if not client_secret or client_secret != OAUTH_CLIENT_SECRET:
         return JSONResponse({"error": "invalid_client"}, status_code=401)
 
     if params.get("grant_type") == "authorization_code" and code:
