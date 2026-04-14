@@ -746,15 +746,6 @@ sse_transport = SseServerTransport("/messages/")
 
 async def check_auth(request: Request) -> JSONResponse | None:
     """Return a 401 response if auth fails, or None if OK."""
-    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    try:
-        is_anthropic = ipaddress.ip_address(client_ip) in ipaddress.ip_network(ANTHROPIC_CIDR, strict=False)
-    except ValueError:
-        is_anthropic = False
-
-    if is_anthropic:
-        return None
-
     auth = request.headers.get("authorization", "")
     token = auth[7:] if auth.startswith("Bearer ") else ""
 
