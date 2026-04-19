@@ -472,12 +472,14 @@ TOOLS = [
     ),
     Tool(
         name="sevdesk_api_request",
-        description="Make a raw GET request to any sevDesk API endpoint for advanced use.",
+        description="Make a raw request to any sevDesk API endpoint. Supports GET (default), POST, PUT, DELETE.",
         inputSchema={
             "type": "object",
             "properties": {
                 "endpoint": {"type": "string", "description": "API path, e.g. /Contact or /Invoice/100"},
-                "params": {"type": "object", "description": "Query parameters"},
+                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE"], "default": "GET"},
+                "params": {"type": "object", "description": "Query parameters (GET)"},
+                "body": {"type": "object", "description": "JSON body (POST/PUT)"},
             },
             "required": ["endpoint"],
         },
@@ -760,7 +762,17 @@ async def _dispatch(name: str, args: dict) -> object:  # noqa: PLR0912 PLR0915
         return {"status": "ok", "server": "sevdesk-mcp", "api_token_set": token_set}
 
     if name == "sevdesk_api_request":
-        return sevdesk_get(args["endpoint"], args.get("params", {}))
+        method = args.get("method", "GET").upper()
+        endpoint = args["endpoint"]
+        if method == "GET":
+            return sevdesk_get(endpoint, args.get("params", {}))
+        if method == "POST":
+            return sevdesk_post(endpoint, args.get("body", {}))
+        if method == "PUT":
+            return sevdesk_put(endpoint, args.get("body", {}))
+        if method == "DELETE":
+            return sevdesk_delete(endpoint)
+        return {"error": f"Unsupported method: {method}"}
 
     return {"error": f"Unknown tool: {name}"}
 
